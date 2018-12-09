@@ -48,7 +48,13 @@
 #include <uapi/linux/android/binder.h>
 #include "binder_trace.h"
 
-static HLIST_HEAD(binder_devices);
+static DEFINE_MUTEX(binder_main_lock);
+static DEFINE_MUTEX(binder_deferred_lock);
+static DEFINE_MUTEX(binder_mmap_lock);
+
+static HLIST_HEAD(binder_procs);
+static HLIST_HEAD(binder_deferred_list);
+static HLIST_HEAD(binder_dead_nodes);
 
 static struct dentry *binder_debugfs_dir_entry_root;
 static struct dentry *binder_debugfs_dir_entry_proc;
@@ -108,9 +114,6 @@ module_param_named(debug_mask, binder_debug_mask, uint, S_IWUSR | S_IRUGO);
 
 static bool binder_debug_no_lock;
 module_param_named(proc_no_lock, binder_debug_no_lock, bool, S_IWUSR | S_IRUGO);
-
-static char *binder_devices_param = CONFIG_ANDROID_BINDER_DEVICES;
-module_param_named(devices, binder_devices_param, charp, S_IRUGO);
 
 static DECLARE_WAIT_QUEUE_HEAD(binder_user_error_wait);
 static int binder_stop_on_user_error;
@@ -220,33 +223,6 @@ static struct binder_transaction_log_entry *binder_transaction_log_add(
 	}
 	return e;
 }
-
-struct binder_context {
-	struct binder_node *binder_context_mgr_node;
-	kuid_t binder_context_mgr_uid;
-	const char *name;
-
-	struct mutex binder_main_lock;
-	struct mutex binder_deferred_lock;
-	struct mutex binder_mmap_lock;
-
-	struct hlist_head binder_procs;
-	struct hlist_head binder_dead_nodes;
-	struct hlist_head binder_deferred_list;
-
-	struct work_struct deferred_work;
-	struct workqueue_struct *binder_deferred_workqueue;
-	struct binder_transaction_log transaction_log;
-	struct binder_transaction_log transaction_log_failed;
-
-	struct binder_stats binder_stats;
-};
-
-struct binder_device {
-	struct hlist_node hlist;
-	struct miscdevice miscdev;
-	struct binder_context context;
-};
 
 struct binder_work {
 	struct list_head entry;
@@ -3557,7 +3533,6 @@ err_bad_arg:
 static int binder_open(struct inode *nodp, struct file *filp)
 {
 	struct binder_proc *proc;
-	struct binder_device *binder_dev;
 
 	binder_debug(BINDER_DEBUG_OPEN_CLOSE, "binder_open: %d:%d\n",
 		     current->group_leader->pid, current->pid);
@@ -3570,9 +3545,6 @@ static int binder_open(struct inode *nodp, struct file *filp)
 	INIT_LIST_HEAD(&proc->todo);
 	init_waitqueue_head(&proc->wait);
 	proc->default_priority = task_nice(current);
-	binder_dev = container_of(filp->private_data, struct binder_device,
-				  miscdev);
-	proc->context = &binder_dev->context;
 
 	binder_lock(proc->context, __func__);
 
@@ -4379,6 +4351,12 @@ static const struct file_operations binder_fops = {
 	.release = binder_release,
 };
 
+static struct miscdevice binder_miscdev = {
+	.minor = MISC_DYNAMIC_MINOR,
+	.name = "binder",
+	.fops = &binder_fops
+};
+
 BINDER_DEBUG_ENTRY(state);
 BINDER_DEBUG_ENTRY(stats);
 BINDER_DEBUG_ENTRY(transactions);
@@ -4392,62 +4370,9 @@ static void __init free_binder_device(struct binder_device *device)
 	kfree(device);
 }
 
-static int __init init_binder_device(const char *name)
-{
-	int ret;
-	struct binder_device *binder_device;
-	struct binder_context *context;
-
-	binder_device = kzalloc(sizeof(*binder_device), GFP_KERNEL);
-	if (!binder_device)
-		return -ENOMEM;
-
-	binder_device->miscdev.fops = &binder_fops;
-	binder_device->miscdev.minor = MISC_DYNAMIC_MINOR;
-	binder_device->miscdev.name = name;
-
-	context = &binder_device->context;
-	context->binder_context_mgr_uid = INVALID_UID;
-	context->name = name;
-
-	mutex_init(&context->binder_main_lock);
-	mutex_init(&context->binder_deferred_lock);
-	mutex_init(&context->binder_mmap_lock);
-
-	context->binder_deferred_workqueue =
-		create_singlethread_workqueue(name);
-
-	if (!context->binder_deferred_workqueue) {
-		ret = -ENOMEM;
-		goto err_create_singlethread_workqueue_failed;
-	}
-
-	INIT_HLIST_HEAD(&context->binder_procs);
-	INIT_HLIST_HEAD(&context->binder_dead_nodes);
-	INIT_HLIST_HEAD(&context->binder_deferred_list);
-	INIT_WORK(&context->deferred_work, binder_deferred_func);
-
-	ret = misc_register(&binder_device->miscdev);
-	if (ret < 0) {
-		goto err_misc_register_failed;
-	}
-
-	hlist_add_head(&binder_device->hlist, &binder_devices);
-	return ret;
-
-err_create_singlethread_workqueue_failed:
-err_misc_register_failed:
-	free_binder_device(binder_device);
-
-	return ret;
-}
-
 static int __init binder_init(void)
 {
-	int ret = 0;
-	char *device_name, *device_names;
-	struct binder_device *device;
-	struct hlist_node *tmp;
+	int ret;
 
 	/*
 	 * Copy the module_parameter string, because we don't want to
@@ -4469,7 +4394,7 @@ static int __init binder_init(void)
 	if (binder_debugfs_dir_entry_root)
 		binder_debugfs_dir_entry_proc = debugfs_create_dir("proc",
 						 binder_debugfs_dir_entry_root);
-
+	ret = misc_register(&binder_miscdev);
 	if (binder_debugfs_dir_entry_root) {
 		debugfs_create_file("state",
 				    S_IRUGO,
@@ -4494,19 +4419,9 @@ static int __init binder_init(void)
 		debugfs_create_file("failed_transaction_log",
 				    S_IRUGO,
 				    binder_debugfs_dir_entry_root,
-				    NULL,
-				    &binder_failed_transaction_log_fops);
+				    &binder_transaction_log_failed,
+				    &binder_transaction_log_fops);
 	}
-
-	return ret;
-
-err_init_binder_device_failed:
-	hlist_for_each_entry_safe(device, tmp, &binder_devices, hlist) {
-		misc_deregister(&device->miscdev);
-		hlist_del(&device->hlist);
-		free_binder_device(device);
-	}
-
 	return ret;
 }
 
